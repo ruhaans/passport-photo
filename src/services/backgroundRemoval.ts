@@ -1,11 +1,33 @@
 const endpoint = `${(import.meta.env.VITE_BACKGROUND_REMOVAL_API_URL ?? "").replace(/\/$/, "")}/api/background/remove`;
+const REQUEST_TIMEOUT_MS = 8_000;
 
 export class BackgroundRemovalApiService {
   async removeBackground(image: File): Promise<Blob> {
     const formData = new FormData();
     formData.append("file", image, image.name);
 
-    const response = await fetch(endpoint, { method: "POST", body: formData });
+    const controller = new AbortController();
+    const timeout = window.setTimeout(
+      () => controller.abort(),
+      REQUEST_TIMEOUT_MS,
+    );
+    let response: Response;
+
+    try {
+      response = await fetch(endpoint, {
+        method: "POST",
+        body: formData,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new Error("Background removal request timed out.");
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+
     if (!response.ok) {
       throw new Error(
         `Background removal request failed (${response.status}).`,

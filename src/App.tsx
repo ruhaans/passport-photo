@@ -211,7 +211,10 @@ export default function App() {
         setImg(image);
       } catch {
         if (requestId === uploadRequestRef.current) {
-          setNotification("Background removal failed. Using original image.");
+          setAutoRemoveBackground(false);
+          setNotification(
+            "Background removal is unavailable. Using the original image; automatic removal is now off.",
+          );
         }
       } finally {
         if (requestId === uploadRequestRef.current) {
