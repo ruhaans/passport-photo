@@ -367,11 +367,7 @@ export default function App() {
       const file = new File([png], fileName, { type: "image/png" });
       if (!navigator.canShare || navigator.canShare({ files: [file] })) {
         try {
-          await navigator.share({
-            title: "Passport photo sheet",
-            text: "Print this image at actual size.",
-            files: [file],
-          });
+          await navigator.share({ files: [file] });
           return;
         } catch (error) {
           if (error instanceof DOMException && error.name === "AbortError") {
