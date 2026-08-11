@@ -14,6 +14,7 @@ import {
   Upload,
   ImageIcon,
   FileImage,
+  Printer,
   RotateCcw,
   RotateCw,
 } from "lucide-react";
@@ -316,30 +317,110 @@ export default function App() {
     draw();
   }, [draw]);
 
-  const downloadPng = () => {
+  const createExportPng = async (): Promise<Blob | null> => {
     const canvas = canvasRef.current;
-    if (!canvas || !img) return;
+    if (!canvas || !img) return null;
     let exportCanvas: HTMLCanvasElement;
     try {
       exportCanvas = cropPreviewMargin(canvas);
     } catch {
       setNotification("Unable to create the PNG. Please try again.");
+      return null;
+    }
+
+    const source = await new Promise<Blob | null>((resolve) => {
+      exportCanvas.toBlob(resolve, "image/png");
+    });
+    if (!source) {
+      setNotification("Unable to create the PNG. Please try again.");
+      return null;
+    }
+
+    try {
+      return await withPngDensity(source, DPI);
+    } catch {
+      setNotification("Unable to create the PNG. Please try again.");
+      return null;
+    }
+  };
+
+  const downloadPng = async () => {
+    const png = await createExportPng();
+    if (!png) return;
+
+    const url = URL.createObjectURL(png);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `passport-photos-${paper}.png`;
+    a.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const printOrShare = async () => {
+    const isMobile = window.matchMedia("(max-width: 1023px)").matches;
+    const fileName = `passport-photos-${paper}.png`;
+
+    if (isMobile && navigator.share) {
+      const png = await createExportPng();
+      if (!png) return;
+
+      const file = new File([png], fileName, { type: "image/png" });
+      if (!navigator.canShare || navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({
+            title: "Passport photo sheet",
+            text: "Print this image at actual size.",
+            files: [file],
+          });
+          return;
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") {
+            return;
+          }
+        }
+      }
+
+      const url = URL.createObjectURL(png);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      a.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setNotification(
+        "Sharing is unavailable here. The PNG was downloaded instead.",
+      );
       return;
     }
-    exportCanvas.toBlob(async (blob) => {
-      if (!blob) return;
-      try {
-        const png = await withPngDensity(blob, DPI);
-        const url = URL.createObjectURL(png);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `passport-photos-${paper}.png`;
-        a.click();
-        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-      } catch {
-        setNotification("Unable to create the PNG. Please try again.");
-      }
-    }, "image/png");
+
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      setNotification(
+        "Your browser blocked the print window. Please allow pop-ups and try again.",
+      );
+      return;
+    }
+
+    const png = await createExportPng();
+    if (!png) {
+      printWindow.close();
+      return;
+    }
+
+    const exportWidthMm =
+      (canvasRef.current!.width - Math.round(OUTER_MARGIN) * 2) / PIXELS_PER_MM;
+    const exportHeightMm =
+      (canvasRef.current!.height - Math.round(OUTER_MARGIN) * 2) /
+      PIXELS_PER_MM;
+    const url = URL.createObjectURL(png);
+    printWindow.document.write(
+      `<!doctype html><html><head><title>Passport photo sheet</title><style>@page { size: ${exportWidthMm}mm ${exportHeightMm}mm; margin: 0; } html, body { margin: 0; padding: 0; } img { display: block; width: ${exportWidthMm}mm; height: ${exportHeightMm}mm; }</style></head><body><img src="${url}" alt="Passport photo sheet"></body></html>`,
+    );
+    printWindow.document.close();
+    printWindow.onafterprint = () => {
+      URL.revokeObjectURL(url);
+      printWindow.close();
+    };
+    window.setTimeout(() => printWindow.print(), 250);
   };
 
   const changePaper = (v: SheetKey) => {
@@ -659,12 +740,22 @@ export default function App() {
               </span>
             </div>
 
-            <div>
+            <div className="space-y-2">
               <Button
                 className="w-full"
                 size="lg"
                 disabled={!img}
-                onClick={downloadPng}
+                onClick={() => void printOrShare()}
+              >
+                <Printer className="size-4" />
+                Print / Share PNG
+              </Button>
+              <Button
+                className="w-full"
+                size="lg"
+                variant="outline"
+                disabled={!img}
+                onClick={() => void downloadPng()}
               >
                 <FileImage className="size-4" />
                 Download PNG (lossless)
