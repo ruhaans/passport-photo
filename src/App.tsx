@@ -1,9 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { jsPDF } from "jspdf";
-import {
-  backgroundRemovalService,
-  compositeTransparentPngOnWhite,
-} from "@/services/backgroundRemoval";
+import { withPngDensity } from "@/services/pngDensity";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
@@ -16,10 +12,8 @@ import {
 } from "@/components/ui/select";
 import {
   Upload,
-  FileDown,
   ImageIcon,
   FileImage,
-  LoaderCircle,
   RotateCcw,
   RotateCw,
 } from "lucide-react";
@@ -31,13 +25,13 @@ import {
       {
         name: "description",
         content:
-          "Arrange 35x45mm passport photos onto 4x6 or A4 sheets at 300 DPI and download a print-ready PDF or PNG. Runs entirely in your browser.",
+          "Arrange 35x45mm passport photos onto 4x6 or A4 sheets at 300 DPI and download a print-ready PNG. Runs entirely in your browser.",
       },
       { property: "og:title", content: "Passport Photo Sheet Builder — 35x45mm Print Layouts" },
       {
         property: "og:description",
         content:
-          "Arrange 35x45mm passport photos onto 4x6 or A4 sheets at 300 DPI and download a print-ready PDF or PNG. Runs entirely in your browser.",
+          "Arrange 35x45mm passport photos onto 4x6 or A4 sheets at 300 DPI and download a print-ready PNG. Runs entirely in your browser.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -50,7 +44,6 @@ const DPI = 300;
 const PIXELS_PER_MM = DPI / 25.4;
 const PHOTO_W = Math.round((35 / 25.4) * DPI);
 const PHOTO_H = Math.round((45 / 25.4) * DPI);
-const PHOTO_RATIO = PHOTO_W / PHOTO_H;
 const OUTER_MARGIN = 4 * PIXELS_PER_MM;
 const ROW_GAP = 1 * PIXELS_PER_MM;
 
@@ -63,11 +56,11 @@ const SHEETS = {
     counts: [1, 2, 4, 6, 8],
   },
   a4: {
-    label: "A4 paper (up to 36 photos)",
+    label: "A4 paper (up to 30 photos)",
     w: 2480,
     h: 3508,
-    maxPhotos: 36,
-    counts: [1, 2, 4, 6, 8, 12, 16, 20, 24, 30, 36],
+    maxPhotos: 30,
+    counts: [1, 2, 4, 6, 8, 12, 16, 20, 24, 30],
   },
 } as const;
 
@@ -92,7 +85,7 @@ function loadBrowserImage(source: Blob): Promise<HTMLImageElement> {
 
 /** Best cols x rows grid for `target` photos on the sheet, or the largest that fits. */
 function planGrid(
-  sheet: (typeof SHEETS)[SheetKey],
+  sheet: { w: number; h: number; maxPhotos: number },
   target: number,
   cellW: number,
   cellH: number,
@@ -130,6 +123,38 @@ function planGrid(
   return { ...best, capacity };
 }
 
+/**
+ * The on-screen sheet keeps a 4 mm safety margin. Exports omit only that
+ * outer margin; pixels within the remaining sheet are copied 1:1, so the
+ * 35 x 45 mm photo cells never change size.
+ */
+function cropPreviewMargin(source: HTMLCanvasElement): HTMLCanvasElement {
+  const marginPixels = Math.round(OUTER_MARGIN);
+  const width = source.width - marginPixels * 2;
+  const height = source.height - marginPixels * 2;
+  if (width <= 0 || height <= 0) {
+    throw new Error("The export area is invalid.");
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Unable to create the export image.");
+  context.drawImage(
+    source,
+    marginPixels,
+    marginPixels,
+    width,
+    height,
+    0,
+    0,
+    width,
+    height,
+  );
+  return canvas;
+}
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -142,8 +167,6 @@ export default function App() {
   const [columnSpacing, setColumnSpacing] = useState(12);
   const [border, setBorder] = useState(3);
   const [dragging, setDragging] = useState(false);
-  const [autoRemoveBackground, setAutoRemoveBackground] = useState(true);
-  const [isRemovingBackground, setIsRemovingBackground] = useState(false);
   const [notification, setNotification] = useState<string | null>(null);
   const [fitMode, setFitMode] = useState<"cover" | "contain">("cover");
   const [zoom, setZoom] = useState(1);
@@ -152,81 +175,42 @@ export default function App() {
   const [rotation, setRotation] = useState(0); // fine straighten, degrees
   const [quarter, setQuarter] = useState(0); // 90° steps
 
-  const loadFile = useCallback(
-    async (file: File) => {
-      if (!["image/jpeg", "image/png"].includes(file.type)) {
-        setNotification("Please upload a JPG, JPEG, or PNG image.");
+  const loadFile = useCallback(async (file: File) => {
+    if (!["image/jpeg", "image/png"].includes(file.type)) {
+      setNotification("Please upload a JPG, JPEG, or PNG image.");
+      return;
+    }
+
+    const requestId = ++uploadRequestRef.current;
+    setFileName(file.name);
+    setNotification(null);
+    try {
+      const image = await loadBrowserImage(file);
+      if (requestId !== uploadRequestRef.current) {
         return;
       }
 
-      const requestId = ++uploadRequestRef.current;
-      setFileName(file.name);
-      setNotification(null);
-      setIsRemovingBackground(autoRemoveBackground);
+      setImg(image);
+      setZoom(1);
+      setOffsetX(0);
+      setOffsetY(0);
+      setRotation(0);
+      setQuarter(0);
 
-      const originalImagePromise = loadBrowserImage(file);
-      const processedImagePromise = autoRemoveBackground
-        ? backgroundRemovalService
-            .removeBackground(file)
-            .then(compositeTransparentPngOnWhite)
-        : null;
-
-      try {
-        const image = await originalImagePromise;
-        if (requestId !== uploadRequestRef.current) {
-          await processedImagePromise?.catch(() => undefined);
-          return;
-        }
-
-        setImg(image);
-        setZoom(1);
-        setOffsetX(0);
-        setOffsetY(0);
-        setRotation(0);
-        setQuarter(0);
-
-        if (window.matchMedia("(max-width: 1023px)").matches) {
-          window.requestAnimationFrame(() => {
-            previewRef.current?.scrollIntoView({
-              behavior: "smooth",
-              block: "start",
-            });
+      if (window.matchMedia("(max-width: 1023px)").matches) {
+        window.requestAnimationFrame(() => {
+          previewRef.current?.scrollIntoView({
+            behavior: "smooth",
+            block: "start",
           });
-        }
-      } catch {
-        void processedImagePromise?.catch(() => undefined);
-        if (requestId === uploadRequestRef.current) {
-          setNotification("Unable to read this image.");
-          setIsRemovingBackground(false);
-        }
-        return;
+        });
       }
-
-      if (!processedImagePromise) return;
-
-      try {
-        const processedImage = await processedImagePromise;
-        const image = await loadBrowserImage(processedImage);
-        if (requestId !== uploadRequestRef.current) return;
-        setImg(image);
-      } catch {
-        if (requestId === uploadRequestRef.current) {
-          setAutoRemoveBackground(false);
-          setNotification(
-            "Background removal is unavailable. Using the original image; automatic removal is now off.",
-          );
-        }
-      } finally {
-        if (requestId === uploadRequestRef.current) {
-          setIsRemovingBackground(false);
-        }
+    } catch {
+      if (requestId === uploadRequestRef.current) {
+        setNotification("Unable to read this image.");
       }
-    },
-    [autoRemoveBackground],
-  );
-
-  const needsCrop =
-    !!img && Math.abs(img.width / img.height - PHOTO_RATIO) > 0.01;
+    }
+  }, []);
 
   // border is drawn OUTSIDE the constant 35x45mm photo area
   const cellW = PHOTO_W + border * 2;
@@ -272,7 +256,6 @@ export default function App() {
     const sin = Math.abs(Math.sin(angle));
     const rotW = srcW * cos + srcH * sin;
     const rotH = srcW * sin + srcH * cos;
-
     let drawn = 0;
     for (let r = 0; r < rows && drawn < count; r++) {
       for (let c = 0; c < cols && drawn < count; c++) {
@@ -313,12 +296,6 @@ export default function App() {
           ctx.fillStyle = "#F4F1EA";
           ctx.fillRect(x, y, PHOTO_W, PHOTO_H);
         }
-
-        if (border === 0) {
-          ctx.strokeStyle = "#DDDDDD";
-          ctx.lineWidth = 1;
-          ctx.strokeRect(x + 0.5, y + 0.5, PHOTO_W - 1, PHOTO_H - 1);
-        }
       }
     }
   }, [
@@ -339,35 +316,29 @@ export default function App() {
     draw();
   }, [draw]);
 
-  const downloadPdf = () => {
-    const canvas = canvasRef.current;
-    if (!canvas || !img) return;
-    const data = canvas.toDataURL("image/png"); // lossless, highest quality
-    const pdf =
-      paper === "4x6"
-        ? new jsPDF({
-            orientation: sheet.w > sheet.h ? "landscape" : "portrait",
-            unit: "in",
-            format: [4, 6],
-          })
-        : new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
-    const w = pdf.internal.pageSize.getWidth();
-    const h = pdf.internal.pageSize.getHeight();
-    pdf.addImage(data, "PNG", 0, 0, w, h, undefined, "NONE");
-    pdf.save(`passport-photos-${paper}.pdf`);
-  };
-
   const downloadPng = () => {
     const canvas = canvasRef.current;
     if (!canvas || !img) return;
-    canvas.toBlob((blob) => {
+    let exportCanvas: HTMLCanvasElement;
+    try {
+      exportCanvas = cropPreviewMargin(canvas);
+    } catch {
+      setNotification("Unable to create the PNG. Please try again.");
+      return;
+    }
+    exportCanvas.toBlob(async (blob) => {
       if (!blob) return;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `passport-photos-${paper}.png`;
-      a.click();
-      URL.revokeObjectURL(url);
+      try {
+        const png = await withPngDensity(blob, DPI);
+        const url = URL.createObjectURL(png);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `passport-photos-${paper}.png`;
+        a.click();
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch {
+        setNotification("Unable to create the PNG. Please try again.");
+      }
     }, "image/png");
   };
 
@@ -411,7 +382,19 @@ export default function App() {
         <div className="grid gap-8 lg:grid-cols-[380px_1fr]">
           {/* Controls */}
           <section className="space-y-6 rounded-2xl border border-border bg-card p-6 shadow-sm">
-            <div
+            <input
+              ref={inputRef}
+              type="file"
+              accept="image/jpeg,image/png"
+              className="sr-only"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void loadFile(f);
+              }}
+            />
+            <button
+              type="button"
+              aria-label="Upload a JPG or PNG photo"
               onDragOver={(e) => {
                 e.preventDefault();
                 setDragging(true);
@@ -421,7 +404,7 @@ export default function App() {
                 e.preventDefault();
                 setDragging(false);
                 const f = e.dataTransfer.files?.[0];
-                if (f) loadFile(f);
+                if (f) void loadFile(f);
               }}
               onClick={() => inputRef.current?.click()}
               className={`flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed p-8 text-center transition-all duration-200 ${
@@ -434,54 +417,21 @@ export default function App() {
               <p className="text-sm font-medium text-foreground">
                 {fileName ?? "Drop a photo here or click to upload"}
               </p>
-              {isRemovingBackground && (
-                <p className="flex items-center gap-2 text-xs font-medium text-primary">
-                  <LoaderCircle className="size-3.5 animate-spin" />
-                  Removing background…
-                </p>
-              )}
               <p className="text-xs text-muted-foreground">
                 JPG or PNG · 35x45mm crop recommended
               </p>
-              <input
-                ref={inputRef}
-                type="file"
-                accept="image/jpeg,image/png"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) loadFile(f);
-                }}
-              />
-            </div>
-
-            <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-border bg-secondary/40 p-4">
-              <input
-                type="checkbox"
-                checked={autoRemoveBackground}
-                onChange={(event) =>
-                  setAutoRemoveBackground(event.target.checked)
-                }
-                className="mt-0.5 size-4 accent-[var(--primary)]"
-              />
-              <span>
-                <span className="block text-sm font-medium text-foreground">
-                  Automatically remove background
-                </span>
-                <span className="mt-0.5 block text-xs text-muted-foreground">
-                  Segments only the background; the photo is otherwise
-                  unchanged.
-                </span>
-              </span>
-            </label>
+            </button>
 
             <div className="space-y-2">
-              <Label>Paper size</Label>
+              <Label id="paper-size-label">Paper size</Label>
               <Select
                 value={paper}
                 onValueChange={(v) => changePaper(v as SheetKey)}
               >
-                <SelectTrigger className="w-full">
+                <SelectTrigger
+                  aria-labelledby="paper-size-label"
+                  className="w-full"
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -495,12 +445,15 @@ export default function App() {
             </div>
 
             <div className="space-y-2">
-              <Label>Photos per sheet</Label>
+              <Label id="photo-count-label">Photos per sheet</Label>
               <Select
                 value={String(perSheet)}
                 onValueChange={(v) => setPerSheet(Number(v))}
               >
-                <SelectTrigger className="w-full">
+                <SelectTrigger
+                  aria-labelledby="photo-count-label"
+                  className="w-full"
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -520,7 +473,7 @@ export default function App() {
 
             <div className="space-y-3">
               <div className="flex items-center justify-between">
-                <Label>Preferred column gap</Label>
+                <Label id="column-gap-label">Preferred column gap</Label>
                 <span className="font-display text-sm tabular-nums text-muted-foreground">
                   {(grid.columnGap / PIXELS_PER_MM).toFixed(1)}mm
                 </span>
@@ -529,6 +482,7 @@ export default function App() {
                 min={0}
                 max={60}
                 step={1}
+                aria-labelledby="column-gap-label"
                 value={[columnSpacing]}
                 onValueChange={(v) => setColumnSpacing(v[0] ?? columnSpacing)}
               />
@@ -539,7 +493,7 @@ export default function App() {
 
             <div className="space-y-3">
               <div className="flex items-center justify-between">
-                <Label>Border thickness</Label>
+                <Label id="cutting-guide-label">Cutting guide thickness</Label>
                 <span className="font-display text-sm tabular-nums text-muted-foreground">
                   {border}px
                 </span>
@@ -548,6 +502,7 @@ export default function App() {
                 min={0}
                 max={12}
                 step={1}
+                aria-labelledby="cutting-guide-label"
                 value={[border]}
                 onValueChange={(v) => setBorder(v[0] ?? border)}
               />
@@ -559,7 +514,7 @@ export default function App() {
             {img && (
               <div className="space-y-3 rounded-xl border border-border bg-secondary/40 p-4">
                 <div className="flex items-center justify-between">
-                  <Label>Straighten</Label>
+                  <Label id="straighten-label">Straighten</Label>
                   <span className="text-xs tabular-nums text-muted-foreground">
                     {rotation > 0
                       ? `+${rotation.toFixed(1)}`
@@ -571,6 +526,7 @@ export default function App() {
                   min={-15}
                   max={15}
                   step={0.1}
+                  aria-labelledby="straighten-label"
                   value={[rotation]}
                   onValueChange={(v) => setRotation(v[0] ?? rotation)}
                 />
@@ -611,19 +567,22 @@ export default function App() {
               </div>
             )}
 
-            {needsCrop && (
+            {img && (
               <div className="space-y-4 rounded-xl border border-accent/40 bg-accent/5 p-4">
                 <p className="text-xs text-muted-foreground">
                   Your photo isn&apos;t 35×45mm. Choose how to fit it, then
                   fine-tune the crop.
                 </p>
                 <div className="space-y-2">
-                  <Label>Fit mode</Label>
+                  <Label id="fit-mode-label">Fit mode</Label>
                   <Select
                     value={fitMode}
                     onValueChange={(v) => setFitMode(v as "cover" | "contain")}
                   >
-                    <SelectTrigger className="w-full">
+                    <SelectTrigger
+                      aria-labelledby="fit-mode-label"
+                      className="w-full"
+                    >
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -638,7 +597,7 @@ export default function App() {
                 </div>
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
-                    <Label>Zoom</Label>
+                    <Label id="zoom-label">Zoom</Label>
                     <span className="text-xs tabular-nums text-muted-foreground">
                       {zoom.toFixed(2)}×
                     </span>
@@ -647,26 +606,31 @@ export default function App() {
                     min={0.5}
                     max={3}
                     step={0.01}
+                    aria-labelledby="zoom-label"
                     value={[zoom]}
                     onValueChange={(v) => setZoom(v[0] ?? zoom)}
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>Horizontal position</Label>
+                  <Label id="horizontal-position-label">
+                    Horizontal position
+                  </Label>
                   <Slider
                     min={-100}
                     max={100}
                     step={1}
+                    aria-labelledby="horizontal-position-label"
                     value={[offsetX]}
                     onValueChange={(v) => setOffsetX(v[0] ?? offsetX)}
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>Vertical position</Label>
+                  <Label id="vertical-position-label">Vertical position</Label>
                   <Slider
                     min={-100}
                     max={100}
                     step={1}
+                    aria-labelledby="vertical-position-label"
                     value={[offsetY]}
                     onValueChange={(v) => setOffsetY(v[0] ?? offsetY)}
                   />
@@ -695,20 +659,10 @@ export default function App() {
               </span>
             </div>
 
-            <div className="space-y-2">
+            <div>
               <Button
                 className="w-full"
                 size="lg"
-                disabled={!img}
-                onClick={downloadPdf}
-              >
-                <FileDown className="size-4" />
-                Download PDF (lossless)
-              </Button>
-              <Button
-                className="w-full"
-                size="lg"
-                variant="outline"
                 disabled={!img}
                 onClick={downloadPng}
               >
