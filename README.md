@@ -26,6 +26,13 @@ npm run build
 The app builds into static files and deploys through the included GitHub Pages
 workflow. No API keys or secrets are required.
 
+## Install as an app
+
+After the GitHub Pages site has loaded once, open it in Chrome on Android and
+tap the browser menu, then choose **Install app** (or **Add to Home screen**).
+The installed app works offline for the editor and PNG generation. Printing and
+sharing still use the phone's installed apps.
+
 ## Print or share
 
 **Print / Share PNG** opens the device share sheet on mobile, where you can
